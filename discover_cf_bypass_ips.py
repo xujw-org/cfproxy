@@ -492,7 +492,7 @@ class CloudflareBypassScanner:
                         
                         sample_ips = []
                         for i in range(0, min(subnet_size, 100), step):
-                            sample_ips.append(IPAddress(int(network.network_address) + i))
+                            sample_ips.append(IPAddress(int(network.network) + i))
                     else:
                         # 如果是小于 /24 的网段，测试所有 IP
                         sample_ips = list(network)
