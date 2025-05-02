@@ -482,24 +482,13 @@ class CloudflareBypassScanner:
                 try:
                     network = IPNetwork(cidr)
                     
-                    # 对于每个 /24 或更大的网段，选择一些代表性 IP 进行测试
-                    sample_size = 5  # 从每个范围中选择的 IP 数量
+                    # 获取网段中的所有 IP 地址
+                    all_ips = list(network)
                     
-                    if network.prefixlen <= 24:
-                        # 如果是 /24 或更大的网段，只取样一些 IP
-                        subnet_size = 2 ** (32 - network.prefixlen)
-                        step = max(1, subnet_size // sample_size)
-                        
-                        sample_ips = []
-                        for i in range(0, min(subnet_size, 100), step):
-                            sample_ips.append(IPAddress(int(network.network) + i))
-                    else:
-                        # 如果是小于 /24 的网段，测试所有 IP
-                        sample_ips = list(network)
+                    self.log(f"从 {cidr} 中选择 {len(all_ips)} 个 IP 进行测试...")
                     
-                    self.log(f"从 {cidr} 中选择 {len(sample_ips)} 个 IP 进行测试...")
-                    
-                    batch_results = self.scan_ip_range(sample_ips, cf_networks)
+                    # 测试所有 IP
+                    batch_results = self.scan_ip_range(all_ips, cf_networks)
                     self.valid_bypass_ips.extend(batch_results)
                     
                     if batch_results:
