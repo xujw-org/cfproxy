@@ -52,6 +52,24 @@ class CloudflareBypassScanner:
         
         # 存储发现的有效 IP
         self.valid_bypass_ips = []
+        
+        # Cloudflare 已知的官方 IP 范围 (常见的)
+        self.known_cf_ranges = [
+            '1.1.1.0/24',       # Cloudflare DNS
+            '1.0.0.0/24',       # Cloudflare 相关
+            '104.16.0.0/12',    # Cloudflare 边缘网络
+            '104.24.0.0/14',    # Cloudflare 边缘网络
+            '108.162.192.0/18', # Cloudflare 边缘网络
+            '162.158.0.0/15',   # Cloudflare 边缘网络
+            '172.64.0.0/13',    # Cloudflare 边缘网络
+            '173.245.48.0/20',  # Cloudflare 边缘网络
+            '190.93.240.0/20',  # Cloudflare 边缘网络
+            '197.234.240.0/22', # Cloudflare 边缘网络
+            '198.41.128.0/17',  # Cloudflare 边缘网络
+        ]
+        
+        # 将已知的官方 IP 范围转换为 IPNetwork 对象
+        self.known_cf_networks = [IPNetwork(cidr) for cidr in self.known_cf_ranges]
     
     def log(self, message):
         """日志输出函数"""
@@ -79,24 +97,22 @@ class CloudflareBypassScanner:
                     ipv4_ranges = data.get('result', {}).get('ipv4_cidrs', [])
                     ipv6_ranges = data.get('result', {}).get('ipv6_cidrs', [])
                     self.log(f"成功获取到 {len(ipv4_ranges)} 个 IPv4 范围和 {len(ipv6_ranges)} 个 IPv6 范围")
-                    return ipv4_ranges, ipv6_ranges
+                    
+                    # 将 API 获取的范围与已知范围合并
+                    combined_ranges = list(set(ipv4_ranges + self.known_cf_ranges))
+                    return combined_ranges, ipv6_ranges
         except Exception as e:
             self.log(f"获取 Cloudflare 官方 IP 范围失败: {e}")
         
-        # 如果 API 请求失败，返回一些已知的 Cloudflare IP 范围
-        default_ipv4 = [
-            '173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22', '103.31.4.0/22',
-            '141.101.64.0/18', '108.162.192.0/18', '190.93.240.0/20', '188.114.96.0/20',
-            '197.234.240.0/22', '198.41.128.0/17', '162.158.0.0/15', '104.16.0.0/13',
-            '172.64.0.0/13', '131.0.72.0/22'
-        ]
-        self.log(f"使用默认的 Cloudflare IP 范围: {len(default_ipv4)} 个 IPv4 范围")
-        return default_ipv4, []
+        # 如果 API 请求失败，返回已知的 Cloudflare IP 范围
+        self.log(f"使用默认的 Cloudflare IP 范围: {len(self.known_cf_ranges)} 个 IPv4 范围")
+        return self.known_cf_ranges, []
     
     def get_target_real_ips(self):
         """通过多种方式获取目标域名的真实 IP 地址"""
         self.log("正在获取目标域名的真实 IP 地址...")
         all_ips = set()
+        origin_server_hints = set()  # 可能的源服务器 IP
         
         for domain in self.target_domains:
             try:
@@ -122,7 +138,50 @@ class CloudflareBypassScanner:
                     except Exception as e:
                         self.verbose_log(f"DNS 服务器 {dns_server} 解析失败 ({domain}): {e}")
                 
-                # 方法3: 尝试 HTTP 请求可能泄露的 IP
+                # 方法3: 尝试通过邮件服务器、子域名等找到可能的源服务器 IP
+                try:
+                    # 检查是否有邮件服务器记录 (MX)
+                    try:
+                        mx_resolver = dns.resolver.Resolver()
+                        mx_answers = mx_resolver.resolve(domain, 'MX')
+                        for rdata in mx_answers:
+                            mx_domain = str(rdata.exchange).rstrip('.')
+                            try:
+                                mx_ips = socket.gethostbyname_ex(mx_domain)[2]
+                                # 邮件服务器通常与网站在同一网络，可能是源服务器的线索
+                                origin_server_hints.update(mx_ips)
+                                self.verbose_log(f"MX 记录 ({mx_domain}): {mx_ips}")
+                            except:
+                                pass
+                    except:
+                        pass
+                    
+                    # 检查是否有 TXT 记录中包含 IP
+                    try:
+                        txt_resolver = dns.resolver.Resolver()
+                        txt_answers = txt_resolver.resolve(domain, 'TXT')
+                        for rdata in txt_answers:
+                            txt_value = str(rdata)
+                            ip_pattern = r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b'
+                            found_ips = re.findall(ip_pattern, txt_value)
+                            origin_server_hints.update(found_ips)
+                            self.verbose_log(f"从 TXT 记录中发现 IP: {found_ips}")
+                    except:
+                        pass
+                    
+                    # 尝试常见的子域名，可能没有启用 Cloudflare
+                    for subdomain in ['direct', 'origin', 'backend', 'cp', 'cpanel', 'server']:
+                        try:
+                            sub_domain = f"{subdomain}.{domain}"
+                            sub_ips = socket.gethostbyname_ex(sub_domain)[2]
+                            origin_server_hints.update(sub_ips)
+                            self.verbose_log(f"子域名 ({sub_domain}): {sub_ips}")
+                        except:
+                            pass
+                except:
+                    pass
+                
+                # 方法4: 尝试 HTTP 请求可能泄露的 IP
                 try:
                     headers = {
                         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -143,11 +202,11 @@ class CloudflareBypassScanner:
                         )
                         
                         # 从响应头中查找可能的 IP
-                        for header in ['X-Served-By', 'Server', 'X-Server', 'X-Host']:
+                        for header in ['X-Served-By', 'Server', 'X-Server', 'X-Host', 'X-Origin', 'X-Real-IP']:
                             if header in response.headers:
                                 ip_pattern = r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b'
                                 found_ips = re.findall(ip_pattern, response.headers[header])
-                                all_ips.update(found_ips)
+                                origin_server_hints.update(found_ips)  # 这些更可能是源服务器 IP
                                 self.verbose_log(f"从 HTTPS 响应头 {header} 发现 IP: {found_ips}")
                     except:
                         pass
@@ -162,11 +221,11 @@ class CloudflareBypassScanner:
                         )
                         
                         # 从响应头中查找可能的 IP
-                        for header in ['X-Served-By', 'Server', 'X-Server', 'X-Host']:
+                        for header in ['X-Served-By', 'Server', 'X-Server', 'X-Host', 'X-Origin', 'X-Real-IP']:
                             if header in response.headers:
                                 ip_pattern = r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b'
                                 found_ips = re.findall(ip_pattern, response.headers[header])
-                                all_ips.update(found_ips)
+                                origin_server_hints.update(found_ips)  # 这些更可能是源服务器 IP
                                 self.verbose_log(f"从 HTTP 响应头 {header} 发现 IP: {found_ips}")
                     except:
                         pass
@@ -186,8 +245,18 @@ class CloudflareBypassScanner:
             except:
                 pass
         
-        self.log(f"成功获取到 {len(public_ips)} 个目标域名的公网 IP")
-        return public_ips
+        # 过滤出可能的源服务器 IP
+        public_origin_hints = []
+        for ip in origin_server_hints:
+            try:
+                ip_obj = ipaddress.ip_address(ip)
+                if not (ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local):
+                    public_origin_hints.append(ip)
+            except:
+                pass
+        
+        self.log(f"成功获取到 {len(public_ips)} 个目标域名的公网 IP 和 {len(public_origin_hints)} 个可能的源服务器 IP")
+        return public_ips, public_origin_hints
     
     def is_ip_in_cloudflare_networks(self, ip, cf_networks):
         """检查 IP 是否在 Cloudflare 的网络范围内"""
@@ -203,6 +272,11 @@ class CloudflareBypassScanner:
     def test_ip_for_cf_bypass(self, ip):
         """测试 IP 是否可以绕过 Cloudflare"""
         self.verbose_log(f"测试 IP: {ip}")
+        
+        # 首先检查 IP 是否在 Cloudflare 官方网络范围内
+        if self.is_ip_in_cloudflare_networks(ip, self.known_cf_networks):
+            self.verbose_log(f"IP {ip} 在 Cloudflare 官方网络范围内，跳过")
+            return False
         
         try:
             # 测试连通性 (根据操作系统选择合适的 ping 命令)
@@ -253,12 +327,15 @@ class CloudflareBypassScanner:
                                 verify=False  # 忽略 SSL 证书验证
                             )
                             
-                            # 检查响应是否包含 Cloudflare 特征
+                            # 检查响应是否包含 Cloudflare 特征但不是官方 Cloudflare 服务器
                             if ('cloudflare' in response.text.lower() or
                                 'cf-ray' in response.headers or
                                 'cf-cache-status' in response.headers):
-                                self.verbose_log(f"IP {ip} 包含 Cloudflare 特征，可能是有效的反代 IP")
-                                return True
+                                
+                                # 确认不是 Cloudflare 官方 IP
+                                if not self.is_ip_in_cloudflare_networks(ip, self.known_cf_networks):
+                                    self.verbose_log(f"IP {ip} 包含 Cloudflare 特征，是有效的反代 IP")
+                                    return True
                         except:
                             pass
                 except:
@@ -268,37 +345,63 @@ class CloudflareBypassScanner:
         
         return False
     
-    def scan_ip_range(self, start_ip, end_ip, cf_networks):
+    def scan_ip_range(self, ip_range, cf_networks):
         """扫描 IP 范围并测试是否为可用的 Cloudflare 反代 IP"""
         valid_ips = []
         
-        try:
-            start = int(IPAddress(start_ip))
-            end = int(IPAddress(end_ip))
+        for ip in ip_range:
+            ip_str = str(ip)
             
-            # 如果范围太大，只取一部分
-            total_ips = end - start + 1
-            if total_ips > 100:
-                # 每隔一定间隔取样
-                step = total_ips // 100
-                ip_range = [IPAddress(start + i * step) for i in range(100)]
-            else:
-                ip_range = [IPAddress(i) for i in range(start, end + 1)]
+            # 首先检查 IP 是否在 Cloudflare 的网络范围内
+            in_cf_network = self.is_ip_in_cloudflare_networks(ip_str, cf_networks)
             
-            for ip in ip_range:
-                ip_str = str(ip)
-                # 检查 IP 是否在 Cloudflare 的网络范围内
-                in_cf_network = self.is_ip_in_cloudflare_networks(ip_str, cf_networks)
-                
-                if not in_cf_network:
-                    # 测试 IP 是否可用作 Cloudflare 反代
-                    if self.test_ip_for_cf_bypass(ip_str):
-                        valid_ips.append(ip_str)
-                        self.log(f"发现有效的反代 IP: {ip_str}")
-        except Exception as e:
-            self.log(f"扫描 IP 范围 {start_ip} - {end_ip} 时出错: {e}")
+            if not in_cf_network:
+                # 测试 IP 是否可用作 Cloudflare 反代
+                if self.test_ip_for_cf_bypass(ip_str):
+                    valid_ips.append(ip_str)
+                    self.log(f"发现有效的反代 IP: {ip_str}")
         
         return valid_ips
+    
+    def generate_ip_range_to_scan(self, target_ip):
+        """生成要扫描的 IP 范围，基于目标 IP"""
+        try:
+            # 将 IP 转换为网络地址对象
+            ip_obj = ipaddress.ip_address(target_ip)
+            ip_int = int(ip_obj)
+            
+            # 生成目标 IP 周围的 IP 范围
+            # 1. 同一 /24 网段
+            network_24 = ipaddress.ip_network(f"{target_ip}/24", strict=False)
+            
+            # 2. 目标 IP 周围的一小段 IP
+            start_nearby = max(ip_int - 5, int(network_24.network_address))
+            end_nearby = min(ip_int + 5, int(network_24.broadcast_address))
+            
+            # 3. 目标 IP 附近的一些随机 IP
+            random_ips = []
+            for offset in [-20, -10, 10, 20, 30, 40, 50]:
+                random_ip = ip_int + offset
+                if int(network_24.network_address) <= random_ip <= int(network_24.broadcast_address):
+                    random_ips.append(ipaddress.ip_address(random_ip))
+            
+            # 合并扫描范围
+            ip_range = []
+            # 添加目标 IP 本身
+            ip_range.append(ip_obj)
+            # 添加目标 IP 附近的 IP
+            for i in range(start_nearby, end_nearby + 1):
+                ip_range.append(ipaddress.ip_address(i))
+            # 添加随机 IP
+            ip_range.extend(random_ips)
+            
+            # 去重排序
+            ip_range = sorted(set(ip_range))
+            
+            return ip_range
+        except Exception as e:
+            self.verbose_log(f"生成 IP 范围时出错: {e}")
+            return []
     
     def discover_bypass_ips(self):
         """发现可用的 Cloudflare 反代 IP"""
@@ -310,59 +413,99 @@ class CloudflareBypassScanner:
         # 将 CIDR 格式转换为 IPNetwork 对象，用于后续检查
         cf_networks = [IPNetwork(cidr) for cidr in cf_ipv4_ranges]
         
-        # 获取目标域名的真实 IP
-        target_ips = self.get_target_real_ips()
+        # 获取目标域名的真实 IP 和可能的源服务器 IP
+        target_ips, origin_hints = self.get_target_real_ips()
         
-        # 1. 先测试从目标域名获取的 IP
-        self.log(f"开始测试 {len(target_ips)} 个目标 IP...")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            future_to_ip = {executor.submit(self.test_ip_for_cf_bypass, ip): ip for ip in target_ips}
-            for future in concurrent.futures.as_completed(future_to_ip):
-                ip = future_to_ip[future]
-                try:
-                    if future.result():
-                        self.valid_bypass_ips.append(ip)
-                        self.log(f"发现可用的反代 IP: {ip}")
-                except Exception as e:
-                    self.verbose_log(f"测试 IP {ip} 时出错: {e}")
+        # 合并两组 IP 但优先考虑可能的源服务器 IP
+        scan_candidates = origin_hints + [ip for ip in target_ips if ip not in origin_hints]
         
-        # 2. 扫描靠近目标 IP 的 IP 段
-        for target_ip in target_ips:
+        # 1. 先测试可能的源服务器 IP
+        if origin_hints:
+            self.log(f"开始测试 {len(origin_hints)} 个可能的源服务器 IP...")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                future_to_ip = {executor.submit(self.test_ip_for_cf_bypass, ip): ip for ip in origin_hints}
+                for future in concurrent.futures.as_completed(future_to_ip):
+                    ip = future_to_ip[future]
+                    try:
+                        if future.result():
+                            self.valid_bypass_ips.append(ip)
+                            self.log(f"发现可用的反代 IP: {ip}")
+                    except Exception as e:
+                        self.verbose_log(f"测试 IP {ip} 时出错: {e}")
+        
+        # 2. 然后测试从目标域名获取的 IP
+        if target_ips:
+            self.log(f"开始测试 {len(target_ips)} 个目标 IP...")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                future_to_ip = {executor.submit(self.test_ip_for_cf_bypass, ip): ip for ip in target_ips}
+                for future in concurrent.futures.as_completed(future_to_ip):
+                    ip = future_to_ip[future]
+                    try:
+                        if future.result():
+                            self.valid_bypass_ips.append(ip)
+                            self.log(f"发现可用的反代 IP: {ip}")
+                    except Exception as e:
+                        self.verbose_log(f"测试 IP {ip} 时出错: {e}")
+        
+        # 3. 智能扫描靠近目标 IP 的 IP 网段
+        for target_ip in scan_candidates:
             try:
-                # 计算目标 IP 所在的 /24 网段
-                ip_parts = target_ip.split('.')
-                network_prefix = '.'.join(ip_parts[:3])
-                
-                # 扫描整个 /24 网段
-                start_ip = f"{network_prefix}.1"
-                end_ip = f"{network_prefix}.254"
-                
-                self.log(f"扫描网段 {start_ip} - {end_ip}...")
-                
-                # 每次扫描 10 个 IP
-                batch_size = 10
-                ip_addr_start = int(IPAddress(start_ip))
-                ip_addr_end = int(IPAddress(end_ip))
-                
-                with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                    futures = []
-                    for i in range(ip_addr_start, ip_addr_end + 1, batch_size):
-                        batch_start = IPAddress(i)
-                        batch_end = IPAddress(min(i + batch_size - 1, ip_addr_end))
-                        futures.append(executor.submit(
-                            self.scan_ip_range, str(batch_start), str(batch_end), cf_networks
-                        ))
+                # 确保 IP 不在 Cloudflare 网络范围内
+                if not self.is_ip_in_cloudflare_networks(target_ip, cf_networks):
+                    # 基于目标 IP 生成要扫描的 IP 范围
+                    ip_range = self.generate_ip_range_to_scan(target_ip)
                     
-                    for future in concurrent.futures.as_completed(futures):
-                        try:
-                            batch_results = future.result()
-                            self.valid_bypass_ips.extend(batch_results)
-                            if batch_results:
-                                self.log(f"在批次中发现 {len(batch_results)} 个可用的反代 IP")
-                        except Exception as e:
-                            self.verbose_log(f"处理扫描结果时出错: {e}")
+                    if ip_range:
+                        self.log(f"扫描 IP {target_ip} 周围的 {len(ip_range)} 个 IP...")
+                        batch_results = self.scan_ip_range(ip_range, cf_networks)
+                        self.valid_bypass_ips.extend(batch_results)
+                        if batch_results:
+                            self.log(f"在 IP {target_ip} 周围发现 {len(batch_results)} 个可用的反代 IP")
             except Exception as e:
                 self.log(f"处理目标 IP {target_ip} 时出错: {e}")
+        
+        # 4. 扫描一些常见的云提供商 IP 段 (可能被用作 Cloudflare 反向代理)
+        common_cloud_ranges = [
+            # 一些常见的使用 Cloudflare 服务的网络范围 (不是 Cloudflare 自己的范围)
+            '192.124.249.0/24',  # 一些托管服务商
+            '193.186.32.0/24',   # 一些托管服务商
+            '149.210.0.0/16',    # 一些托管服务商
+            '185.116.0.0/16',    # 一些托管服务商
+            '103.21.244.0/24',   # 可能的反代 IP 段
+            '103.22.200.0/24',   # 可能的反代 IP 段
+        ]
+        
+        if common_cloud_ranges:
+            self.log(f"扫描 {len(common_cloud_ranges)} 个常见的云提供商 IP 段...")
+            
+            for cidr in common_cloud_ranges:
+                try:
+                    network = IPNetwork(cidr)
+                    
+                    # 对于每个 /24 或更大的网段，选择一些代表性 IP 进行测试
+                    sample_size = 5  # 从每个范围中选择的 IP 数量
+                    
+                    if network.prefixlen <= 24:
+                        # 如果是 /24 或更大的网段，只取样一些 IP
+                        subnet_size = 2 ** (32 - network.prefixlen)
+                        step = max(1, subnet_size // sample_size)
+                        
+                        sample_ips = []
+                        for i in range(0, min(subnet_size, 100), step):
+                            sample_ips.append(IPAddress(int(network.network_address) + i))
+                    else:
+                        # 如果是小于 /24 的网段，测试所有 IP
+                        sample_ips = list(network)
+                    
+                    self.log(f"从 {cidr} 中选择 {len(sample_ips)} 个 IP 进行测试...")
+                    
+                    batch_results = self.scan_ip_range(sample_ips, cf_networks)
+                    self.valid_bypass_ips.extend(batch_results)
+                    
+                    if batch_results:
+                        self.log(f"在 {cidr} 中发现 {len(batch_results)} 个可用的反代 IP")
+                except Exception as e:
+                    self.log(f"处理网段 {cidr} 时出错: {e}")
         
         # 去重
         self.valid_bypass_ips = list(set(self.valid_bypass_ips))
