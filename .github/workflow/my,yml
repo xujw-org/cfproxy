@@ -1,0 +1,17 @@
+name: Debug with tmate
+
+on:
+  workflow_dispatch:   # 手动触发
+  push:                # 也可以设置 push 自动触发（可选）
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    timeout-minutes: 9999   # 👈 超长时间，保证不会自动断掉
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start tmate session
+        uses: mxschmitt/action-tmate@v3
+        with:
+          limit-access-to-actor: true   # 只允许你自己访问
