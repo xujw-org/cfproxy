@@ -13,16 +13,10 @@ jobs:
       - name: Start tmate session
         uses: mxschmitt/action-tmate@v3
         with:
-          limit-access-to-actor: true   # 只允许触发 workflow 的人访问
-    outputs:
-      ssh: ${{ steps.tmate.outputs.ssh }}
-      web: ${{ steps.tmate.outputs.web }}
+          limit-access-to-actor: true
 
-  show-info:
-    runs-on: ubuntu-latest
-    needs: debug
-    steps:
-      - name: Show connection info
+      - name: Show WebURL
+        if: always()
         run: |
-          echo "👉 SSH 地址: ${{ needs.debug.outputs.ssh }}"
-          echo "👉 Web 地址: ${{ needs.debug.outputs.web }}"
+          echo "👉 WebURL:"
+          tmate -S /tmp/tmate.sock display -p '#{tmate_web}'
