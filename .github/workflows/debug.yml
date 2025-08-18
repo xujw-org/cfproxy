@@ -1,4 +1,4 @@
-name: Debug with tmate
+name: Debug with tmate Web
 
 on:
   workflow_dispatch:
@@ -6,17 +6,21 @@ on:
 jobs:
   debug:
     runs-on: ubuntu-latest
-    timeout-minutes: 9999
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Start tmate session
-        uses: mxschmitt/action-tmate@v3
-        with:
-          limit-access-to-actor: true
-
-      - name: Show WebURL
-        if: always()
+      - name: Install tmate
         run: |
+          sudo apt-get update
+          sudo apt-get install -y tmate
+
+      - name: Start tmate
+        run: |
+          tmate -S /tmp/tmate.sock new-session -d
+          tmate -S /tmp/tmate.sock wait tmate-ready
+          echo "👉 SSH 地址:"
+          tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}'
           echo "👉 WebURL:"
           tmate -S /tmp/tmate.sock display -p '#{tmate_web}'
+          
+          # 让 job 保持运行，不要退出
+          sleep infinity
