@@ -21,6 +21,9 @@ jobs:
           tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}'
           echo "👉 WebURL:"
           tmate -S /tmp/tmate.sock display -p '#{tmate_web}'
-          
-          # 让 job 保持运行，不要退出
-          sleep infinity
+          # 心跳打印，防止 GitHub 以为任务卡死
+          while true; do
+            echo "tmate session running..."
+            sleep 60
+          done
+
